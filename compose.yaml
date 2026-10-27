@@ -1,0 +1,18 @@
+services:
+  wmm:
+    build: .
+    image: tg-wmm:local
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN required}
+      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS:?ALLOWED_USER_IDS required}
+      PROXY_URL: ${PROXY_URL:-}
+      TIMEZONE: ${TIMEZONE:-Europe/Moscow}
+      DATABASE_PATH: /data/wmm.db
+    volumes:
+      - wmm_data:/data
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  wmm_data:
