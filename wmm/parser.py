@@ -25,7 +25,7 @@ CATEGORIES: dict[str, tuple[str, ...]] = {
     "Прочее": (),
 }
 SPLIT = re.compile(r"[,;](?!\d)|\n+|\.(?=\s+[-—–]*[а-яёa-z])", re.I)
-MONEY = re.compile(r"(?<![\w])(\d[\d ]*(?:[.,]\d{1,2})?)(?:\s*(?:₽|руб(?:лей|ля|\.|ль)?))?(?![\w])", re.I)
+MONEY = re.compile(r"(?<![\w])(\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)(?:\s*(?:₽|руб(?:лей|ля|\.|ль)?))?(?![\w])", re.I)
 RELATIVE_DATE = re.compile(r"^(сегодня|вчера|позавчера)\s+", re.I)
 REPAY = re.compile(r"^\s*(?:погасил(?:а)?|погашение|закинул(?:а)?|внёс|внес|оплатил(?:а)?\s+кредитк\w*)\b", re.I)
 
@@ -167,8 +167,18 @@ def parse_repayment(text: str, sources: dict[str, int], default_source: int,
     for label, source_id in sorted(sources.items(), key=lambda x: -len(x[0])):
         if "кредит" not in normalize(label) and not re.search(r"\bк\d+\b", normalize(label)):
             continue
-        if re.search(r"(?<!\w)" + re.escape(label).replace(r"\ ", r"\s*") + r"(?!\w)", first, re.I):
-            target = source_id
+        # "Кредитка 1" may be written as "кредитку1" or "кредитку 1" in speech.
+        forms = [label]
+        if label.casefold().startswith("кредитка"):
+            forms += [re.sub(r"^кредитка", ending, label, flags=re.I)
+                      for ending in ("кредитку", "кредитке", "кредитки")]
+        for form in forms:
+            pattern = re.escape(form).replace(r"\ ", r"\s*")
+            pattern = re.sub(r"(?<=[а-яёa-z])(?=\d)", r"\\s*", pattern, flags=re.I)
+            if re.search(r"(?<!\w)" + pattern + r"(?!\w)", first, re.I):
+                target = source_id
+                break
+        if target is not None:
             break
     if target is None:
         raise ParseError("Не понял, какую кредитку погашаешь. Добавь её через /source_add.")

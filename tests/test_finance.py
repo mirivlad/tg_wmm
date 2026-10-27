@@ -65,6 +65,12 @@ class ParserTests(unittest.TestCase):
                          (900000, 600000, 300000))
         self.assertEqual(repay.target_source_id, 2)
 
+    def test_repayment_russian_case_forms(self):
+        for name in ("кредитку1", "кредитку 1", "кредитке1"):
+            repay = parse_repayment(f"погасил {name} 9000, зачислилось 6000",
+                                    self.sources, 1, now=NOW)
+            self.assertEqual(repay.interest_minor, 300000)
+
     def test_repayment_requires_allocation(self):
         with self.assertRaises(ParseError):
             parse_repayment("погасил кредитка1 9000", self.sources, 1, now=NOW)
