@@ -101,12 +101,34 @@ class Database:
             if version not in (0, 1):
                 raise RuntimeError(f"Unknown database schema version: {version}")
             db.executescript(SCHEMA)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS category_rules (
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    builtin_name TEXT NOT NULL,
+                    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+                    PRIMARY KEY(user_id, builtin_name)
+                )
+            """)
+            # Also seed links for existing v0.1 databases without touching custom names.
+            for user in db.execute("SELECT id FROM users").fetchall():
+                self._seed_category_rules(db, user["id"])
+
+    @staticmethod
+    def _seed_category_rules(db: sqlite3.Connection, user_id: int) -> None:
+        for label in CATEGORIES:
+            db.execute(
+                "INSERT OR IGNORE INTO category_rules(user_id,builtin_name,category_id) "
+                "SELECT ?,?,id FROM categories WHERE user_id=? AND name=? COLLATE NOCASE",
+                (user_id, label, user_id, label),
+            )
 
     def ensure_user(self, user_id: int) -> None:
         with self.connection() as db:
-            db.execute("INSERT OR IGNORE INTO users(id) VALUES (?)", (user_id,))
-            for category in CATEGORIES:
-                db.execute("INSERT OR IGNORE INTO categories(user_id,name) VALUES (?,?)", (user_id, category))
+            inserted = db.execute("INSERT OR IGNORE INTO users(id) VALUES (?)", (user_id,)).rowcount
+            if inserted:
+                for category in CATEGORIES:
+                    db.execute("INSERT INTO categories(user_id,name) VALUES (?,?)", (user_id, category))
+                self._seed_category_rules(db, user_id)
             current = db.execute("SELECT default_source_id FROM users WHERE id=?", (user_id,)).fetchone()
             if current["default_source_id"] is None:
                 cur = db.execute("INSERT INTO sources(user_id,name,kind) VALUES (?, 'Основной','debit')", (user_id,))
@@ -132,8 +154,21 @@ class Database:
             return mapping, default["default_source_id"]
 
     def category_names(self, user_id: int) -> list[str]:
+        return [row["name"] for row in self.categories(user_id)]
+
+    def categories(self, user_id: int) -> list[sqlite3.Row]:
         with self.connection() as db:
-            return [r["name"] for r in db.execute("SELECT name FROM categories WHERE user_id=? ORDER BY name", (user_id,))]
+            return db.execute("SELECT c.id,c.name,COUNT(o.id) AS uses FROM categories c "
+                              "LEFT JOIN operations o ON o.category_id=c.id AND o.user_id=c.user_id "
+                              "WHERE c.user_id=? GROUP BY c.id ORDER BY c.name COLLATE NOCASE",
+                              (user_id,)).fetchall()
+
+    def category(self, user_id: int, category_id: int) -> sqlite3.Row | None:
+        with self.connection() as db:
+            return db.execute("SELECT c.id,c.name,COUNT(o.id) AS uses FROM categories c "
+                              "LEFT JOIN operations o ON o.category_id=c.id AND o.user_id=c.user_id "
+                              "WHERE c.user_id=? AND c.id=? GROUP BY c.id",
+                              (user_id, category_id)).fetchone()
 
     def learned_aliases(self, user_id: int) -> dict[str, str]:
         with self.connection() as db:
@@ -162,16 +197,91 @@ class Database:
                 db.execute("UPDATE users SET default_source_id=? WHERE id=?", (source_id, user_id))
             return bool(owned)
 
-    def add_category(self, user_id: int, name: str) -> None:
-        if not name or len(name) > 60:
-            raise ValueError("Название категории: 1–60 символов.")
+    @staticmethod
+    def _clean_category_name(name: str) -> str:
+        name = " ".join(name.strip().split())
+        if not name or len(name) > 60 or name.startswith("/"):
+            raise ValueError("Название категории: от 1 до 60 символов, без начального «/».")
+        return name
+
+    def add_category(self, user_id: int, name: str) -> int:
+        name = self._clean_category_name(name)
         with self.connection() as db:
-            db.execute("INSERT INTO categories(user_id,name) VALUES (?,?)", (user_id, name))
+            db.execute("BEGIN IMMEDIATE")
+            if self._lookup_category(db, user_id, name):
+                raise ValueError("Такая категория уже существует.")
+            result = db.execute("INSERT INTO categories(user_id,name) VALUES (?,?)", (user_id, name))
+            return result.lastrowid
+
+    def rename_category(self, user_id: int, category_id: int, name: str) -> bool:
+        name = self._clean_category_name(name)
+        with self.connection() as db:
+            old = db.execute("SELECT name FROM categories WHERE user_id=? AND id=?",
+                             (user_id, category_id)).fetchone()
+            if not old:
+                return False
+            if old["name"].casefold() == "прочее":
+                raise ValueError("Системную категорию «Прочее» нельзя переименовать.")
+            if name.casefold() == "прочее":
+                raise ValueError("Категория «Прочее» уже существует.")
+            existing = self._lookup_category(db, user_id, name)
+            if existing and existing["id"] != category_id:
+                raise ValueError("Такая категория уже существует.")
+            db.execute("UPDATE categories SET name=? WHERE user_id=? AND id=?",
+                       (name, user_id, category_id))
+            return True
+
+    def delete_category(self, user_id: int, category_id: int) -> int | None:
+        """Move existing expenses to Other, delete learned aliases/rules, then category."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            target = db.execute("SELECT name FROM categories WHERE user_id=? AND id=?",
+                                (user_id, category_id)).fetchone()
+            if not target:
+                return None
+            if target["name"].casefold() == "прочее":
+                raise ValueError("Системную категорию «Прочее» нельзя удалять.")
+            other_id = self._category_id(db, user_id, "Прочее")
+            count = db.execute("UPDATE operations SET category_id=?, unclassified=1 "
+                               "WHERE user_id=? AND category_id=?",
+                               (other_id, user_id, category_id)).rowcount
+            db.execute("DELETE FROM learned_aliases WHERE user_id=? AND category_id=?",
+                       (user_id, category_id))
+            db.execute("DELETE FROM category_rules WHERE user_id=? AND category_id=?",
+                       (user_id, category_id))
+            db.execute("DELETE FROM categories WHERE user_id=? AND id=?",
+                       (user_id, category_id))
+            return count
+
+    def create_and_assign_category(self, user_id: int, operation_id: int, name: str) -> int | None:
+        """Atomic create-and-assign. Return None for a missing/foreign operation."""
+        name = self._clean_category_name(name)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT description FROM operations "
+                             "WHERE user_id=? AND id=? AND kind='expense'",
+                             (user_id, operation_id)).fetchone()
+            if not row:
+                return None
+            # If user typed an existing category, use it instead of creating a duplicate.
+            existing = self._lookup_category(db, user_id, name)
+            category_id = (existing["id"] if existing else
+                           db.execute("INSERT INTO categories(user_id,name) VALUES (?,?)",
+                                      (user_id, name)).lastrowid)
+            self._assign_category(db, user_id, operation_id, row["description"], category_id)
+            return category_id
 
     @staticmethod
-    def _category_id(db: sqlite3.Connection, user_id: int, name: str) -> int:
-        row = db.execute("SELECT id FROM categories WHERE user_id=? AND name=? COLLATE NOCASE",
-                         (user_id, name)).fetchone()
+    def _lookup_category(db: sqlite3.Connection, user_id: int, name: str) -> sqlite3.Row | None:
+        # SQLite NOCASE only handles ASCII; Russian categories need Unicode case folding.
+        for row in db.execute("SELECT id,name FROM categories WHERE user_id=?", (user_id,)):
+            if row["name"].casefold() == name.casefold():
+                return row
+        return None
+
+    @classmethod
+    def _category_id(cls, db: sqlite3.Connection, user_id: int, name: str) -> int:
+        row = cls._lookup_category(db, user_id, name)
         if not row:
             raise ValueError("Нет такой категории.")
         return row["id"]
@@ -186,13 +296,23 @@ class Database:
                 return []
             ids = []
             for index, item in enumerate(items):
-                category = self._category_id(db, user_id, item.category)
+                category_row = self._lookup_category(db, user_id, item.category)
+                if category_row is None:
+                    category_row = db.execute(
+                        "SELECT category_id AS id FROM category_rules "
+                        "WHERE user_id=? AND builtin_name=?", (user_id, item.category),
+                    ).fetchone()
+                if category_row is None and item.category not in CATEGORIES:
+                    raise ValueError("Нет такой категории.")
+                unclassified = item.unclassified or category_row is None
+                category = (category_row["id"] if category_row is not None else
+                            self._category_id(db, user_id, "Прочее"))
                 cur = db.execute(
                     "INSERT INTO operations (user_id,kind,amount_minor,source_id,category_id,"
                     "description,original_text,occurred_at,chat_id,message_id,part_index,batch_key,unclassified) "
                     "VALUES (?,'expense',?,?,?,?,?,?,?,?,?,?,?)",
                     (user_id, item.amount_minor, item.source_id, category, item.description, original,
-                     item.occurred_at, chat_id, message_id, index, batch, int(item.unclassified)),
+                     item.occurred_at, chat_id, message_id, index, batch, int(unclassified)),
                 )
                 ids.append(cur.lastrowid)
             return ids
@@ -226,7 +346,27 @@ class Database:
                 (user_id, limit),
             ).fetchall()
 
+    def operation(self, user_id: int, operation_id: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT o.*,s.name AS source_name,c.name AS category_name "
+                "FROM operations o JOIN sources s ON s.id=o.source_id "
+                "LEFT JOIN categories c ON c.id=o.category_id "
+                "WHERE o.user_id=? AND o.id=?", (user_id, operation_id)
+            ).fetchone()
+
+    def update_description(self, user_id: int, operation_id: int, description: str) -> bool:
+        description = " ".join(description.strip().split())
+        if not description or len(description) > 200 or description.startswith("/"):
+            raise ValueError("Название покупки: от 1 до 200 символов, без начального «/».")
+        with self.connection() as conn:
+            result = conn.execute(
+                "UPDATE operations SET description=? WHERE user_id=? AND id=? AND kind='expense'",
+                (description, user_id, operation_id))
+            return bool(result.rowcount)
+
     def update_amount(self, user_id: int, operation_id: int, amount_minor: int) -> bool:
+        """Adjust the recorded total of an ordinary expense."""
         with self.connection() as db:
             cur = db.execute("UPDATE operations SET amount_minor=? WHERE id=? AND user_id=? AND kind='expense'",
                              (amount_minor, operation_id, user_id))
@@ -246,6 +386,27 @@ class Database:
             db.execute("INSERT INTO learned_aliases(user_id,alias,category_id) VALUES (?,?,?) "
                        "ON CONFLICT(user_id,alias) DO UPDATE SET category_id=excluded.category_id",
                        (user_id, key, category))
+            return True
+
+    @staticmethod
+    def _assign_category(conn, owner_id, record_id, label, category_id):
+        conn.execute("UPDATE operations SET category_id=? WHERE id=? AND user_id=?",
+                     (category_id, record_id, owner_id))
+        key = normalize(label)
+        if key:
+            conn.execute("INSERT INTO learned_aliases(user_id,alias,category_id) VALUES (?,?,?) "
+                         "ON CONFLICT(user_id,alias) DO UPDATE SET category_id=excluded.category_id",
+                         (owner_id, key, category_id))
+
+    def assign_category(self, user_id, operation_id, category_id):
+        with self.connection() as conn:
+            record = conn.execute("SELECT description FROM operations WHERE user_id=? AND id=? AND kind='expense'",
+                                  (user_id, operation_id)).fetchone()
+            category = conn.execute("SELECT id FROM categories WHERE user_id=? AND id=?",
+                                    (user_id, category_id)).fetchone()
+            if not record or not category:
+                return False
+            self._assign_category(conn, user_id, operation_id, record["description"], category_id)
             return True
 
     def delete(self, user_id: int, operation_id: int) -> bool:

@@ -16,6 +16,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 
 from .config import Settings
 from .db import Database
+from .menus import category_manager, history_keyboard, receipt_keyboard, register_menus
 from .parser import ParseError, minor, parse_expenses, parse_repayment, rub
 
 LOG = logging.getLogger("wmm")
@@ -38,6 +39,8 @@ HELP = (
     "/source_add НАЗВАНИЕ | credit/debit/cash | АЛИАС,АЛИАС\n"
     "/source_default ID — основной источник\n"
     "/export — выгрузка всех операций в CSV\n"
+    "/cancel — отменить ввод исправления\n"
+    "Исправление записи и управление категориями доступны кнопками.\n"
     "/help — эта справка\n\n"
     "Пока поддерживается текст. Фото чеков, QR и голос добавим позже. "
     "Для погашения кредитки необходима разбивка по основному долгу и процентам."
@@ -158,7 +161,8 @@ def make_router(settings: Settings, db: Database) -> Router:
 
     @router.message(Command("categories"))
     async def on_categories(message: Message):
-        await message.answer("Категории:\n" + "\n".join("• " + n for n in db.category_names(message.from_user.id)))
+        text, reply = category_manager(db, message.from_user.id, 0)
+        await message.answer(text, reply_markup=reply)
 
     @router.message(Command("category_add"))
     async def on_category_add(message: Message):
@@ -185,7 +189,7 @@ def make_router(settings: Settings, db: Database) -> Router:
             stamp = r["occurred_at"][:10]
             lines.append(f"#{r['id']} {stamp}: {label} — {rub(r['amount_minor'])}, {r['source_name']}")
         lines.append("\nИзменить: /edit ID СУММА или /category ID НАЗВАНИЕ")
-        await message.answer("\n".join(lines))
+        await message.answer("\n".join(lines), reply_markup=history_keyboard(rows))
 
     @router.message(Command("undo"))
     async def on_undo(message: Message):
@@ -259,6 +263,8 @@ def make_router(settings: Settings, db: Database) -> Router:
             await callback.message.answer(report_text(db, callback.from_user.id, "month", settings.timezone))
         await callback.answer()
 
+    register_menus(router, db)
+
     @router.message(F.text)
     async def on_text(message: Message):
         uid = message.from_user.id
@@ -290,11 +296,12 @@ def make_router(settings: Settings, db: Database) -> Router:
             return await message.answer("Это сообщение уже учтено.")
         lines = [f"Записано операций: {len(ids)}"]
         for op, item in zip(ids, items):
-            suffix = " (не уверен — исправь /category)" if item.unclassified else ""
-            lines.append(f"#{op} {item.description}: {rub(item.amount_minor)} — {item.category}{suffix}")
+            saved = db.operation(uid, op)
+            suffix = " (не уверен — нажми кнопку исправления)" if saved["unclassified"] else ""
+            lines.append(f"#{op} {item.description}: {rub(item.amount_minor)} — {saved['category_name']}{suffix}")
         lines.append(f"\nВсего: {rub(sum(x.amount_minor for x in items))}")
         await message.answer("\n".join(lines),
-                             reply_markup=keyboard(f"{message.chat.id}:{message.message_id}"))
+                             reply_markup=receipt_keyboard(f"{message.chat.id}:{message.message_id}", [(i, x.description) for i, x in zip(ids, items)]))
 
     @router.message()
     async def on_media(message: Message):
