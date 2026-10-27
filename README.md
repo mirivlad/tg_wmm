@@ -58,7 +58,22 @@
 
 Compose создаст постоянный volume wmm_data самостоятельно.
 
-Для Portainer: можно клонировать репозиторий на хосте и развернуть Compose как локальный Stack, либо выбрать Git repository и compose.yaml. В некоторых версиях Portainer сборка с директивой build из Git-stack не поддерживается: в этом случае сначала соберите образ и укажите его в поле image, удалив build. В интерфейсе Portainer переменные BOT_TOKEN, ALLOWED_USER_IDS, PROXY_URL, TIMEZONE задаются как Environment variables стека — не храните секреты в YAML.
+### Установка через Portainer прямо из Git (без сборки)
+
+Используйте **portainer-stack.yml**, а не compose.yaml (последний оставлен для локального запуска через build). В portainer-stack.yml уже указан готовый образ GHCR.
+
+1. Portainer → **Stacks → Add stack → Git repository**; имя стека, например, `tg-wmm`.
+2. Repository URL: `https://github.com/mirivlad/tg_wmm`
+3. Repository reference: `refs/heads/main`
+4. Compose path: `portainer-stack.yml`
+5. В **Environment variables** задайте `BOT_TOKEN` (токен из BotFather) и `ALLOWED_USER_IDS` (ваши цифровые Telegram ID через запятую). Дополнительно можно задать `PROXY_URL` и `TIMEZONE` (по умолчанию Europe/Moscow). Токен не храните в Git.
+6. Нажмите **Deploy the stack**. Имена контейнера и volume Portainer сформирует автоматически; база останется в Docker volume при обновлениях.
+
+**Важно при самом первом запуске:** Docker-образ `ghcr.io/mirivlad/tg_wmm:latest` публикует GitHub Actions workflow `.github/workflows/publish-image.yml` при изменениях приложения в main (или вручную через `workflow_dispatch`). Дождитесь его успешного завершения в GitHub → Actions. При первом выпуске пакет GHCR может быть **Private по умолчанию** даже у публичного репозитория. Чтобы Portainer мог без пароля его скачать, откройте GitHub → профиль → Packages → `tg_wmm` → Package settings → Change visibility → Public (обратный перевод в Private может быть недоступен). Другой вариант — настроить авторизацию Portainer в GHCR с токеном `read:packages`.
+
+Обновления: GitHub Actions создаёт новый образ с тегом `latest` и уникальным SHA. В Portainer выполните **Pull and redeploy**, включив **Re-pull image**. Для автоматического обновления настройте GitOps с повторной загрузкой образов или webhook после публикации; сам по себе push нового тега `latest` не обязательно заставляет Portainer пересоздать контейнер.
+
+
 
 Прокси: PROXY_URL=socks5://user:password@proxy-host:1080 либо http://proxy-host:3128. Если не нужен, оставьте пустым. Прокси должен быть доступен из контейнера; localhost внутри контейнера — это не Docker-хост.
 

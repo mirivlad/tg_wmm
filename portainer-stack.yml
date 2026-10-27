@@ -1,0 +1,25 @@
+# Portainer -> Stacks -> Add stack -> Git repository
+# Repository: https://github.com/mirivlad/tg_wmm
+# Reference: refs/heads/main
+# Compose path: portainer-stack.yml
+#
+# No 'build:' here: Portainer pulls a GHCR image published by GitHub Actions.
+# Set BOT_TOKEN and ALLOWED_USER_IDS using Portainer's Environment variables.
+services:
+  wmm:
+    image: ghcr.io/mirivlad/tg_wmm:latest
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in Portainer environment variables}
+      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS:?Set ALLOWED_USER_IDS in Portainer environment variables}
+      PROXY_URL: ${PROXY_URL:-}
+      TIMEZONE: ${TIMEZONE:-Europe/Moscow}
+      DATABASE_PATH: /data/wmm.db
+    volumes:
+      - wmm_data:/data
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  wmm_data:
