@@ -16,6 +16,7 @@ services:
       PROXY_URL: ${PROXY_URL:-}
       TIMEZONE: ${TIMEZONE:-Europe/Moscow}
       DATABASE_PATH: /data/wmm.db
+      WMM_OCR_ENGINE: ${WMM_OCR_ENGINE:-rapidocr}
     volumes:
       - wmm_data:/data
     security_opt:

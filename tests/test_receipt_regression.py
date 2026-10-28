@@ -28,6 +28,27 @@ class RealReceiptRegressionTests(unittest.TestCase):
     def test_payment_amount_preferred_to_before_discount(self):
         self.assertEqual(ocr_total(OCR_SAMPLE), 238792)
 
+    def test_modern_ocr_split_product_and_price_lines(self):
+        """PP-OCRv5 detects product name and amount as separate lines."""
+        from wmm.receipts import parse_items
+        lines = """НдС 10% Сухарики ржаные с чесноком
+359.99*0.250KГ=90.00
+НДС 22% Кофе Бариста Про зерно 1000г
+1499.99*1WТ.=1499.99
+НДС 22% Вино Санта Каролина
+699.99*1ШТ.=699.99
+НДС 10% Булочка Детство с сахаром 55г
+12.99*6ШТ.=77.94
+НДС 22% Пакет-майка 23мк
+10.00*2ШТ.=20.00
+ИТОГО 2387.92"""
+        items = parse_items(lines)
+        self.assertEqual(len(items), 5)
+        self.assertEqual([x.amount_minor for x in items], [9000, 149999, 69999, 7794, 2000])
+        self.assertEqual(sum(x.amount_minor for x in items), 238792)
+        self.assertIn("Сухарики", items[0].name)
+        self.assertIn("Кофе", items[1].name)
+
     def test_never_classify_payment_or_discount_lines_as_items(self):
         items = parse_items(OCR_SAMPLE)
         joined = "\n".join(item.name for item in items).casefold()

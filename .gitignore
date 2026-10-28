@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-ocrcheck/
 *.db
 *.sqlite
 *.db-wal

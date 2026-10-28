@@ -89,38 +89,75 @@ def fiscal_qr(text: str, tz: str) -> tuple[int, str, str] | None:
 
 
 def parse_items(text: str) -> tuple[Item, ...]:
-    """Conservative: only item + its final line price; ignore fiscal/payment metadata."""
-    items: list[Item] = []
-    for line in text.splitlines():
-        line = re.sub(r"\s+", " ", line.strip()).strip("-–* ")
-        from .receipt_heuristics import VAT_PREFIX
-        # VAT annotation is often printed before a genuine product name.
-        label_line = VAT_PREFIX.sub("", line)
-        if len(label_line) < 5 or is_service_line(label_line):
+    """Pair VAT-labelled product lines with their separate price/quantity lines.
+
+    A standalone terminal or fiscal amount must never become a product.
+    A sum matching the receipt's total is necessary but not sufficient for
+    trusting the itemization: the user must review it in Telegram.
+    """
+    from .receipt_heuristics import VAT_PREFIX
+
+    result: list[Item] = []
+    pending: str | None = None
+
+    def append(name: str, amount: int) -> None:
+        if amount > 0 and name and re.search(r"[А-Яа-яЁёA-Za-z]{3,}", name):
+            result.append(Item(name=name[:100], amount_minor=amount))
+
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw.strip()).strip("-–* ")
+        vat_label = VAT_PREFIX.match(line)
+        if vat_label:
+            pending = None
+        cleaned = clean_item_name(VAT_PREFIX.sub("", line))
+        if not cleaned or is_service_line(cleaned):
             continue
-        line = label_line
-        money = list(AMOUNT.finditer(line))
-        if not money:
+
+        prices = list(AMOUNT.finditer(cleaned))
+        amount_match = prices[-1] if prices else None
+        arithmetic = bool(re.search(r"\d[\d.,]*\s*[*×xх]\s*\d", cleaned, re.I) and
+                          "=" in cleaned)
+
+        if not amount_match:
+            if vat_label:
+                # A new VAT label starts a new item. Never reuse an unrelated
+                # previous name when the price for it was not readable.
+                pending = cleaned if re.search(r"[А-Яа-яЁёA-Za-z]{3,}", cleaned) else None
+            elif pending and not re.search(r"^\d", cleaned):
+                pending = (pending + " " + cleaned)[:180]
             continue
-        amount_match = money[-1]
-        trailing = line[amount_match.end():].strip(" ₽р.уб")
-        if trailing and not re.fullmatch(r"[₽руб.\s]*", trailing, re.I):
-            continue
-        name = clean_item_name(line[:amount_match.start()])
-        # Do not treat pure quantity/price calculations as products.
-        if not name or not re.search(r"[А-Яа-яЁёA-Za-z]{3,}", name):
-            continue
-        if re.search(r"(^|\s)(?:шт|кг|x|х)\s*[\d,. ]", name, re.I) and len(name) < 16:
-            continue
-        name = name[:100]
+
         try:
             amount = money_to_minor(amount_match.group(1))
         except ReceiptError:
             continue
-        items.append(Item(name=name, amount_minor=amount))
-        if len(items) > MAX_ITEMS:
+
+        after = cleaned[amount_match.end():].strip(" ₽р.уб")
+        if after and not re.fullmatch(r"[₽руб.\s]*", after, re.I):
+            continue
+
+        if arithmetic:
+            if pending:
+                append(pending, amount)
+                pending = None
+                if len(result) > MAX_ITEMS:
+                    return ()
+                continue
+            product_name = clean_item_name(cleaned[:amount_match.start()])
+            # Product and price may share a line; name before its formula.
+            if product_name:
+                append(product_name, amount)
+        else:
+            name = clean_item_name(cleaned[:amount_match.start()])
+            if vat_label or (name and not pending):
+                append(name, amount)
+            elif pending and name:
+                append(pending + " " + name, amount)
+            pending = None
+
+        if len(result) > MAX_ITEMS:
             return ()
-    return tuple(items)
+    return tuple(result)
 
 
 def ocr_total(text: str) -> int | None:
@@ -151,7 +188,7 @@ def recognize(image_bytes: bytes, tz: str) -> Recognized:
     if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
         raise ReceiptError("Размер изображения должен быть до 10 МБ.")
     from PIL import Image, ImageEnhance, ImageOps, ImageFilter
-    import pytesseract
+    from .ocr_engine import read_text, tesseract_text
     from pyzbar.pyzbar import decode as decode_barcodes, ZBarSymbol
     try:
         Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
@@ -209,15 +246,11 @@ def recognize(image_bytes: bytes, tz: str) -> Recognized:
                     break
             if qr_text:
                 break
-    gray = ImageEnhance.Contrast(gray_original).enhance(1.6)
-    if gray.width < 1400:
-        scale = min(2.5, 1400 / gray.width)
-        gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
-    if max(gray.size) > 3200:
-        gray.thumbnail((3200, 3200))
+    ocr_image = original.copy()
+    ocr_image.thumbnail((1900, 3000))
     try:
-        text = pytesseract.image_to_string(gray, lang="rus+eng", config="--psm 6", timeout=20)
-    except (RuntimeError, pytesseract.TesseractError, OSError) as exc:
+        text = read_text(ocr_image)
+    except (RuntimeError, OSError, ValueError) as exc:
         if not qr_text:
             raise ReceiptError("Не удалось распознать текст. Попробуй более чёткое фото.") from exc
         text = ""
@@ -233,10 +266,10 @@ def recognize(image_bytes: bytes, tz: str) -> Recognized:
         if max(bottom.size) > 3200:
             bottom.thumbnail((3200, 3200))
         try:
-            payment_text = pytesseract.image_to_string(
-                bottom, lang="rus+eng", config="--psm 6", timeout=12
-            )
-        except (RuntimeError, pytesseract.TesseractError, OSError):
+            payment_text = read_text(bottom)
+            if not ocr_total(payment_text):
+                payment_text = tesseract_text(bottom)
+        except (RuntimeError, OSError, ValueError):
             payment_text = ""
         payment_total = ocr_total(payment_text)
         if payment_total:
