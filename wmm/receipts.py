@@ -4,11 +4,13 @@ from __future__ import annotations
 import hashlib
 import io
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
+
+from .receipt_heuristics import clean_item_name, detected_date, detected_total, is_service_line
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
@@ -91,8 +93,12 @@ def parse_items(text: str) -> tuple[Item, ...]:
     items: list[Item] = []
     for line in text.splitlines():
         line = re.sub(r"\s+", " ", line.strip()).strip("-–* ")
-        if len(line) < 5 or SKIP.search(line):
+        from .receipt_heuristics import VAT_PREFIX
+        # VAT annotation is often printed before a genuine product name.
+        label_line = VAT_PREFIX.sub("", line)
+        if len(label_line) < 5 or is_service_line(label_line):
             continue
+        line = label_line
         money = list(AMOUNT.finditer(line))
         if not money:
             continue
@@ -100,8 +106,7 @@ def parse_items(text: str) -> tuple[Item, ...]:
         trailing = line[amount_match.end():].strip(" ₽р.уб")
         if trailing and not re.fullmatch(r"[₽руб.\s]*", trailing, re.I):
             continue
-        name = line[:amount_match.start()].strip(" .:;—")
-        name = re.sub(r"^\d{1,3}[.)]\s*", "", name)
+        name = clean_item_name(line[:amount_match.start()])
         # Do not treat pure quantity/price calculations as products.
         if not name or not re.search(r"[А-Яа-яЁёA-Za-z]{3,}", name):
             continue
@@ -119,14 +124,7 @@ def parse_items(text: str) -> tuple[Item, ...]:
 
 
 def ocr_total(text: str) -> int | None:
-    for line in reversed(text.splitlines()):
-        matched = TOTAL.search(re.sub(r"\s+", " ", line))
-        if matched:
-            try:
-                return money_to_minor(matched.group(1))
-            except ReceiptError:
-                continue
-    return None
+    return detected_total(text)
 
 
 def from_text(image_bytes: bytes, qr: str, ocr: str, tz: str,
@@ -135,7 +133,8 @@ def from_text(image_bytes: bytes, qr: str, ocr: str, tz: str,
     fiscal = fiscal_qr(qr, tz) if qr else None
     items = parse_items(ocr)
     total = fiscal[0] if fiscal else ocr_total(ocr)
-    date = fiscal[1] if fiscal else (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(timespec="seconds")
+    date = (fiscal[1] if fiscal else detected_date(ocr, tz) or
+            (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(timespec="seconds"))
     key = fiscal[2] if fiscal else key
     # A safe neutral name when vendor identity cannot be established reliably.
     return Recognized(
@@ -151,7 +150,7 @@ def recognize(image_bytes: bytes, tz: str) -> Recognized:
     """Blocking OCR/QR decode; call through asyncio.to_thread."""
     if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
         raise ReceiptError("Размер изображения должен быть до 10 МБ.")
-    from PIL import Image, ImageEnhance, ImageOps, UnidentifiedImageError
+    from PIL import Image, ImageEnhance, ImageOps, ImageFilter
     import pytesseract
     from pyzbar.pyzbar import decode as decode_barcodes, ZBarSymbol
     try:
@@ -167,7 +166,14 @@ def recognize(image_bytes: bytes, tz: str) -> Recognized:
             raise
         raise ReceiptError("Не удалось прочитать изображение чека.") from exc
     qr_text = ""
-    for variant in (original, ImageOps.grayscale(original)):
+    # Scan both full photo and dedicated areas: a QR may occupy only a small
+    # fraction of a long receipt, especially in Telegram-compressed photos.
+    gray_original = ImageOps.grayscale(original)
+    w, h = original.size
+    candidates = (original, gray_original,
+                  gray_original.crop((w // 2, h // 2, w, h)),
+                  gray_original.crop((w // 3, 0, w, h // 2)))
+    for variant in candidates:
         barcodes = decode_barcodes(variant, symbols=[ZBarSymbol.QRCODE])
         for code in barcodes:
             for encoding in ("utf-8", "cp866"):
@@ -175,14 +181,35 @@ def recognize(image_bytes: bytes, tz: str) -> Recognized:
                     candidate = code.data.decode(encoding)
                 except UnicodeDecodeError:
                     continue
-                if fiscal_qr(candidate, tz):
+                try:
+                    matches_fiscal = fiscal_qr(candidate, tz)
+                except ReceiptError:
+                    matches_fiscal = None
+                if matches_fiscal:
                     qr_text = candidate
                     break
             if qr_text:
                 break
         if qr_text:
             break
-    gray = ImageEnhance.Contrast(ImageOps.grayscale(original)).enhance(1.6)
+    if not qr_text:
+        # Additional limited QR-only pass on the two isolated regions.
+        for crop in candidates[2:]:
+            enhanced = ImageOps.autocontrast(crop)
+            enhanced = enhanced.resize((crop.width * 2, crop.height * 2))
+            enhanced = enhanced.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140))
+            for code in decode_barcodes(enhanced, symbols=[ZBarSymbol.QRCODE]):
+                candidate = code.data.decode("utf-8", errors="replace")
+                try:
+                    matches_fiscal = fiscal_qr(candidate, tz)
+                except ReceiptError:
+                    matches_fiscal = None
+                if matches_fiscal:
+                    qr_text = candidate
+                    break
+            if qr_text:
+                break
+    gray = ImageEnhance.Contrast(gray_original).enhance(1.6)
     if gray.width < 1400:
         scale = min(2.5, 1400 / gray.width)
         gray = gray.resize((int(gray.width * scale), int(gray.height * scale)))
@@ -194,4 +221,28 @@ def recognize(image_bytes: bytes, tz: str) -> Recognized:
         if not qr_text:
             raise ReceiptError("Не удалось распознать текст. Попробуй более чёткое фото.") from exc
         text = ""
-    return from_text(image_bytes, qr_text, text, tz)
+    result = from_text(image_bytes, qr_text, text, tz)
+    if result.total_minor is None:
+        # Targeted fallback: payment/fiscal block usually occupies the bottom
+        # half of long receipts. Keep this OCR separate so duplicate product
+        # rows do not contaminate the itemization.
+        bottom = gray_original.crop((0, int(h * 0.50), w, h))
+        bottom = ImageOps.autocontrast(bottom)
+        if bottom.width < 1400:
+            bottom = bottom.resize((bottom.width * 2, bottom.height * 2))
+        if max(bottom.size) > 3200:
+            bottom.thumbnail((3200, 3200))
+        try:
+            payment_text = pytesseract.image_to_string(
+                bottom, lang="rus+eng", config="--psm 6", timeout=12
+            )
+        except (RuntimeError, pytesseract.TesseractError, OSError):
+            payment_text = ""
+        payment_total = ocr_total(payment_text)
+        if payment_total:
+            result = replace(result, total_minor=payment_total)
+        if not qr_text:
+            printed_date = detected_date(payment_text, tz)
+            if printed_date and not detected_date(text, tz):
+                result = replace(result, occurred_at=printed_date)
+    return result

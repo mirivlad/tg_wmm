@@ -43,8 +43,10 @@ def preview(db: Database, draft, tz: str) -> tuple[str, InlineKeyboardMarkup]:
         f"Название: {draft['description']}",
         f"Источник: {source}",
         "Дата: " + datetime.fromisoformat(draft["occurred_at"]).astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M"),
-        "Фискальный QR: " + ("найден" if draft["qr_text"] else "не найден"),
+        "Фискальный QR: " + ("прочитан" if draft["qr_text"] else "не удалось прочитать"),
     ]
+    if amount and not draft["qr_text"]:
+        lines.append("⚠️ Итог взят из OCR, а не из фискального QR. Проверь сумму по чеку.")
     if data:
         lines.append("\nСтроки, предположительно распознанные OCR:")
         for item in data[:10]:
