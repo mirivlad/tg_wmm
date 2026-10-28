@@ -10,6 +10,7 @@ from aiogram.types import Message, Update
 from wmm.bot import make_router
 from wmm.config import Settings
 from wmm.db import Database
+from wmm.receipt_store import ReceiptStore
 
 
 class SimulatedBot(Bot):
@@ -37,6 +38,7 @@ class MenuFlowTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(folder.cleanup)
         self.db = Database(str(Path(folder.name) / "journal.db"))
         self.db.initialize()
+        ReceiptStore(self.db).initialize()
         settings = Settings("123456:TEST", frozenset([7]), "unused", "Europe/Moscow", None)
         self.dispatcher = Dispatcher()
         self.dispatcher.include_router(make_router(settings, self.db))
@@ -100,6 +102,27 @@ class MenuFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.click(f"ui:pick:{record_id}:{transport['id']}")
         self.assertEqual(self.db.operation(7, record_id)["category_name"], "Транспорт")
         self.assertEqual(self.db.learned_aliases(7)["неизвестная покупка"], "Транспорт")
+
+    async def test_fiscal_qr_preview_and_confirmation(self):
+        qr = "t=20261028T1330&s=180.00&fn=000110000105&i=1234567890&fp=123456&n=1"
+        await self.message(qr)
+        self.assertEqual(len(self.db.history(7)), 0)
+        store = ReceiptStore(self.db)
+        draft = store.draft(7, 1)
+        self.assertEqual(draft["total_minor"], 18000)
+        await self.click(f"rc:save:{draft['id']}:all")
+        self.assertEqual(len(self.db.history(7)), 1)
+        self.assertEqual(self.db.history(7)[0]["amount_minor"], 18000)
+
+    async def test_receipt_edit_amount_then_confirm(self):
+        qr = "t=20261028T1330&s=180.00&fn=000110000105&i=1234567890&fp=123456&n=1"
+        await self.message(qr)
+        draft = ReceiptStore(self.db).draft(7, 1)
+        await self.click(f"rc:amount:{draft['id']}")
+        await self.message("200,50")
+        self.assertEqual(ReceiptStore(self.db).draft(7, draft["id"])["total_minor"], 20050)
+        await self.click(f"rc:save:{draft['id']}:all")
+        self.assertEqual(self.db.history(7)[0]["amount_minor"], 20050)
 
     async def test_cancel_edit_then_enter_new_expense(self):
         await self.message("кофе 100")

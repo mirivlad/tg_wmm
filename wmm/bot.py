@@ -18,6 +18,8 @@ from .config import Settings
 from .db import Database
 from .menus import category_manager, history_keyboard, receipt_keyboard, register_menus
 from .parser import ParseError, minor, parse_expenses, parse_repayment, rub
+from .receipt_store import ReceiptStore
+from .receipt_ui import register_receipts
 
 LOG = logging.getLogger("wmm")
 
@@ -42,7 +44,7 @@ HELP = (
     "/cancel — отменить ввод исправления\n"
     "Исправление записи и управление категориями доступны кнопками.\n"
     "/help — эта справка\n\n"
-    "Пока поддерживается текст. Фото чеков, QR и голос добавим позже. "
+    "Отправь фото чека, изображение-файл или текст фискального QR: сначала проверишь распознавание, затем подтвердишь. Голос добавим позже. "
     "Для погашения кредитки необходима разбивка по основному долгу и процентам."
 )
 
@@ -263,6 +265,8 @@ def make_router(settings: Settings, db: Database) -> Router:
             await callback.message.answer(report_text(db, callback.from_user.id, "month", settings.timezone))
         await callback.answer()
 
+    receipt_store = ReceiptStore(db)
+    register_receipts(router, db, receipt_store, settings.timezone)
     register_menus(router, db)
 
     @router.message(F.text)
@@ -305,7 +309,7 @@ def make_router(settings: Settings, db: Database) -> Router:
 
     @router.message()
     async def on_media(message: Message):
-        await message.answer("Пока принимаю только текст. Фото чеков, QR и голос — в следующих версиях.")
+        await message.answer("Отправь чек фотографией или JPEG/PNG/WebP-файлом. Голос пока не поддерживается.")
 
     return router
 
@@ -314,6 +318,7 @@ async def run() -> None:
     settings = Settings.from_env()
     db = Database(settings.database_path)
     db.initialize()
+    ReceiptStore(db).initialize()
     session = AiohttpSession(proxy=settings.proxy_url) if settings.proxy_url else AiohttpSession()
     bot = Bot(token=settings.bot_token, session=session)
     dispatcher = Dispatcher()

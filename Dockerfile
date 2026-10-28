@@ -5,6 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DATABASE_PATH=/data/wmm.db
 
 WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+         tesseract-ocr tesseract-ocr-rus tesseract-ocr-eng libzbar0 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin wmm \
