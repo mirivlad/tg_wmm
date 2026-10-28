@@ -15,10 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin wmm \
     && mkdir /data && chown -R 10001:10001 /data
 
-COPY wmm/ ./wmm/
-# Bundle checksum-validated Russian PP-OCRv5 models into the image.
-# This prevents first receipt processing from depending on runtime internet access.
+# Models are cached independently from ordinary application code changes.
+COPY wmm/ocr_engine.py ./wmm/ocr_engine.py
 RUN python -c "from wmm.ocr_engine import get_rapidocr; get_rapidocr()"
+COPY wmm/ ./wmm/
 USER 10001:10001
 VOLUME ["/data"]
 CMD ["python", "-m", "wmm"]

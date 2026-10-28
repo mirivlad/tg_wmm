@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS receipt_drafts (
   total_minor INTEGER,
   items_json TEXT NOT NULL,
   source_id INTEGER NOT NULL REFERENCES sources(id),
+  category_id INTEGER REFERENCES categories(id),
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','saved','discarded')),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(user_id, chat_id, message_id)
@@ -44,6 +45,9 @@ class ReceiptStore:
     def initialize(self):
         with self.db.connection() as conn:
             conn.executescript(CREATE_SQL)
+            columns = {r['name'] for r in conn.execute('PRAGMA table_info(receipt_drafts)')}
+            if 'category_id' not in columns:
+                conn.execute('ALTER TABLE receipt_drafts ADD COLUMN category_id INTEGER REFERENCES categories(id)')
 
     def draft(self, user_id: int, draft_id: int) -> sqlite3.Row | None:
         with self.db.connection() as conn:
@@ -109,6 +113,57 @@ class ReceiptStore:
                                   (value, draft_id, user_id))
             return bool(result.rowcount)
 
+    def _category(self, conn, user_id: int, description: str, preferred: int | None = None):
+        if preferred is not None:
+            selected = conn.execute(
+                "SELECT id,name FROM categories WHERE id=? AND user_id=?",
+                (preferred, user_id),
+            ).fetchone()
+            if selected is None:
+                raise ReceiptError("Выбранная категория больше не существует.")
+            return selected, False
+        category, unknown = category_for(description, self.db.learned_aliases(user_id))
+        selected = self.db._lookup_category(conn, user_id, category)
+        if not selected:
+            selected = conn.execute(
+                "SELECT c.id,c.name FROM category_rules r JOIN categories c ON c.id=r.category_id "
+                "WHERE r.user_id=? AND r.builtin_name=?", (user_id, category),
+            ).fetchone()
+        if not selected:
+            selected = self.db._lookup_category(conn, user_id, "Прочее")
+            unknown = True
+        return selected, unknown
+
+    def category_label(self, user_id: int, description: str, preferred: int | None = None) -> str:
+        with self.db.connection() as conn:
+            found, _ = self._category(conn, user_id, description, preferred)
+            return found["name"]
+
+    def set_category(self, user_id: int, draft_id: int, slot: str,
+                     category_id: int) -> bool:
+        """Use slot 'all' for one expense, or 0-based item index for itemized."""
+        with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            draft = conn.execute("SELECT * FROM receipt_drafts WHERE id=? AND user_id=? AND status='pending'",
+                                 (draft_id, user_id)).fetchone()
+            category = conn.execute("SELECT 1 FROM categories WHERE id=? AND user_id=?",
+                                    (category_id, user_id)).fetchone()
+            if not draft or not category:
+                return False
+            if slot == "all":
+                conn.execute("UPDATE receipt_drafts SET category_id=? WHERE id=?", (category_id, draft_id))
+                return True
+            if not slot.isdigit():
+                return False
+            index = int(slot)
+            items = json.loads(draft["items_json"])
+            if index < 0 or index >= len(items):
+                return False
+            items[index]["category_id"] = category_id
+            conn.execute("UPDATE receipt_drafts SET items_json=? WHERE id=?",
+                         (json.dumps(items, ensure_ascii=False), draft_id))
+            return True
+
     def discard(self, user_id: int, draft_id: int) -> bool:
         with self.db.connection() as conn:
             result = conn.execute("UPDATE receipt_drafts SET status='discarded' "
@@ -133,8 +188,8 @@ class ReceiptStore:
             if split and (not items or len(items) > 25 or
                           sum(x["amount_minor"] for x in items) != draft["total_minor"]):
                 raise ReceiptError("Суммы товаров не сходятся с итогом чека. Выбери общую сумму.")
-            entries = ([(str(x["name"]), int(x["amount_minor"])) for x in items] if split
-                       else [(draft["description"], draft["total_minor"])])
+            entries = ([(str(x["name"]), int(x["amount_minor"]), x.get("category_id")) for x in items] if split
+                       else [(draft["description"], draft["total_minor"], draft["category_id"])])
             if not conn.execute("SELECT 1 FROM sources WHERE id=? AND user_id=?",
                                 (draft["source_id"], user_id)).fetchone():
                 raise ReceiptError("Выбранный источник больше не существует.")
@@ -145,18 +200,10 @@ class ReceiptStore:
             learned = self.db.learned_aliases(user_id)
             ids = []
             original = ("Фискальный QR: " + draft["qr_text"] + "\n" if draft["qr_text"] else "") + draft["ocr_text"]
-            for index, (description, amount) in enumerate(entries):
+            for index, (description, amount, selected_category) in enumerate(entries):
                 if amount <= 0 or not description:
                     raise ReceiptError("Некорректная товарная позиция.")
-                category, unknown = category_for(description, learned)
-                actual = self.db._lookup_category(conn, user_id, category)
-                if not actual:
-                    actual = conn.execute(
-                        "SELECT category_id AS id FROM category_rules WHERE user_id=? AND builtin_name=?",
-                        (user_id, category)).fetchone()
-                if not actual:
-                    actual = self.db._lookup_category(conn, user_id, "Прочее")
-                    unknown = True
+                actual, unknown = self._category(conn, user_id, description, selected_category)
                 cur = conn.execute(
                     "INSERT INTO operations (user_id,kind,amount_minor,source_id,category_id,"
                     "description,original_text,occurred_at,chat_id,message_id,part_index,batch_key,unclassified) "

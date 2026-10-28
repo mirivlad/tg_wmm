@@ -124,6 +124,28 @@ class MenuFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.click(f"rc:save:{draft['id']}:all")
         self.assertEqual(self.db.history(7)[0]["amount_minor"], 20050)
 
+    async def test_receipt_category_can_be_set_before_confirming(self):
+        from wmm.receipt_store import ReceiptStore
+        qr = "t=20261028T1330&s=180.00&fn=000110000105&i=1234567890&fp=123456&n=1"
+        await self.message(qr)
+        draft = ReceiptStore(self.db).draft(7, 1)
+        target = next(c["id"] for c in self.db.categories(7) if c["name"] == "Продукты")
+        await self.click(f"rc:cats:{draft['id']}")
+        await self.click(f"rc:catlist:{draft['id']}:all:0")
+        await self.click(f"rc:catset:{draft['id']}:all:{target}")
+        await self.click(f"rc:save:{draft['id']}:all")
+        self.assertEqual(self.db.history(7)[0]["category_name"], "Продукты")
+
+    async def test_receipt_create_category_before_confirming(self):
+        from wmm.receipt_store import ReceiptStore
+        qr = "t=20261028T1330&s=180.00&fn=000110000105&i=1234567890&fp=123456&n=1"
+        await self.message(qr)
+        draft = ReceiptStore(self.db).draft(7, 1)
+        await self.click(f"rc:catnew:{draft['id']}:all")
+        await self.message("Общие покупки")
+        await self.click(f"rc:save:{draft['id']}:all")
+        self.assertEqual(self.db.history(7)[0]["category_name"], "Общие покупки")
+
     async def test_cancel_edit_then_enter_new_expense(self):
         await self.message("кофе 100")
         record_id = self.db.history(7)[0]["id"]

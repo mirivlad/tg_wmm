@@ -28,6 +28,18 @@ class CategoryManagementTests(unittest.TestCase):
     def category_id(self, name: str) -> int:
         return next(r["id"] for r in self.db.categories(7) if r["name"] == name)
 
+    def test_alcohol_category_migrates_only_once(self):
+        category_id = self.category_id("Алкоголь")
+        with self.db.connection() as conn:
+            conn.execute("DELETE FROM category_rules WHERE category_id=? AND user_id=?", (category_id, 7))
+            conn.execute("DELETE FROM categories WHERE id=? AND user_id=?", (category_id, 7))
+            conn.execute("PRAGMA user_version=1")
+        self.db.initialize()
+        self.assertIn("Алкоголь", self.db.category_names(7))
+        self.db.delete_category(7, self.category_id("Алкоголь"))
+        self.db.initialize()
+        self.assertNotIn("Алкоголь", self.db.category_names(7))
+
     def test_rename_builtin_keeps_auto_assignment_after_restart(self):
         groceries_id = self.category_id("Продукты")
         self.assertTrue(self.db.rename_category(7, groceries_id, "Питание дома"))

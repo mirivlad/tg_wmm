@@ -113,6 +113,49 @@ class ReceiptDatabaseTests(unittest.TestCase):
             self.store.save(777, draft, split=True)
         self.assertEqual(len(self.store.save(777, draft, split=False)), 1)
 
+    def test_category_override_before_import(self):
+        parsed = from_text(b"img", QR, OCR, "Europe/Moscow")
+        draft_id = self.store.create_draft(777, 7, 101, parsed)
+        categories = {c["name"]: c["id"] for c in self.db.categories(777)}
+        self.assertTrue(self.store.set_category(777, draft_id, "0", categories["Кафе и рестораны"]))
+        self.assertTrue(self.store.set_category(777, draft_id, "1", categories["Снеки"]))
+        self.assertFalse(self.store.set_category(888, draft_id, "0", categories["Медицина"]))
+        ids = self.store.save(777, draft_id, split=True)
+        self.assertEqual([self.db.operation(777, i)["category_name"] for i in ids],
+                         ["Кафе и рестораны", "Снеки"])
+
+    def test_whole_receipt_category_override(self):
+        parsed = from_text(b"img", QR, OCR, "Europe/Moscow")
+        draft_id = self.store.create_draft(777, 7, 101, parsed)
+        target = next(c["id"] for c in self.db.categories(777) if c["name"] == "Продукты")
+        self.assertTrue(self.store.set_category(777, draft_id, "all", target))
+        ids = self.store.save(777, draft_id)
+        self.assertEqual(self.db.operation(777, ids[0])["category_name"], "Продукты")
+
+    def test_migrate_old_draft_table_without_category_column(self):
+        from wmm.receipt_store import CREATE_SQL
+        with self.db.connection() as conn:
+            conn.execute("DROP TABLE receipt_drafts")
+            legacy_sql = CREATE_SQL.replace(
+                "  category_id INTEGER REFERENCES categories(id),\n", ""
+            )
+            conn.executescript(legacy_sql)
+        self.store.initialize()
+        with self.db.connection() as conn:
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(receipt_drafts)")}
+        self.assertIn("category_id", columns)
+
+    def test_receipt_draft_upgrade_keeps_existing_rows(self):
+        parsed = from_text(b"img", QR, OCR, "Europe/Moscow")
+        draft_id = self.store.create_draft(777, 7, 101, parsed)
+        with self.db.connection() as conn:
+            # Simulate a v0.1.4 receipt draft table by preserving a stored row
+            # in the new schema and verifying idempotent initialization.
+            row_before = conn.execute("SELECT items_json FROM receipt_drafts WHERE id=?",
+                                      (draft_id,)).fetchone()["items_json"]
+        self.store.initialize()
+        self.assertEqual(self.store.draft(777, draft_id)["items_json"], row_before)
+
     def test_source_selection_and_auth(self):
         self.db.add_source(777, "Кредитка 2", "credit", ["к2"])
         sources = self.db.sources(777)

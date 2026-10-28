@@ -49,6 +49,26 @@ class RealReceiptRegressionTests(unittest.TestCase):
         self.assertIn("Сухарики", items[0].name)
         self.assertIn("Кофе", items[1].name)
 
+    def test_real_ocr_does_not_assign_cracker_price_to_coffee(self):
+        """Actual scan: 90 rub belongs to unseen crackers, NOT the coffee."""
+        from wmm.receipts import parse_items
+        ocr = """НДС 22% КОФе Бариста Про Бар зернО 100Ог м/У;6
+359.99*0.250KG=90.00
+1499.99*1ШT.=1499.99
+АКЦИ3
+66669
+Х H о H   е
+11.5-12% 0.75л
+699.99*1т.=699.99
+ндс 10% Булочка детство с сахаром 55г командор 12.9жшт, 77.94
+ндс 22% пакет-майка пнд 38+1860 23мк с логотипом аллея: 1500
+10.00*2шT.=20.00"""
+        items = parse_items(ocr)
+        coffee = next(x for x in items if "КОФе" in x.name)
+        self.assertEqual(coffee.amount_minor, 149999)
+        self.assertNotIn(9000, [x.amount_minor for x in items])
+        self.assertNotIn(69999, [x.amount_minor for x in items])  # wine name missing
+
     def test_never_classify_payment_or_discount_lines_as_items(self):
         items = parse_items(OCR_SAMPLE)
         joined = "\n".join(item.name for item in items).casefold()

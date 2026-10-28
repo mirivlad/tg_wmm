@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS operation_lines (
 );
 CREATE INDEX IF NOT EXISTS ix_operations_user_date ON operations(user_id,occurred_at);
 CREATE INDEX IF NOT EXISTS ix_operations_batch ON operations(user_id,batch_key);
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 """
 
 
@@ -98,7 +98,7 @@ class Database:
         with self.connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError(f"Unknown database schema version: {version}")
             db.executescript(SCHEMA)
             db.execute("""
@@ -109,7 +109,14 @@ class Database:
                     PRIMARY KEY(user_id, builtin_name)
                 )
             """)
-            # Also seed links for existing v0.1 databases without touching custom names.
+            # Add the new standard Alcohol category once during v1->v2 migration.
+            # Don't recreate it on subsequent starts if the user deletes it.
+            if version == 1:
+                for user in db.execute("SELECT id FROM users").fetchall():
+                    if not self._lookup_category(db, user["id"], "Алкоголь"):
+                        db.execute("INSERT INTO categories(user_id,name) VALUES (?,'Алкоголь')",
+                                   (user["id"],))
+            # Keep existing category mappings and custom renames.
             for user in db.execute("SELECT id FROM users").fetchall():
                 self._seed_category_rules(db, user["id"])
 

@@ -1,3 +1,3 @@
 """Where My Money: private self-hosted Telegram finance journal."""
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"

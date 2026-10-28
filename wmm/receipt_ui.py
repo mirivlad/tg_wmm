@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import math
+import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,7 @@ from .receipts import ReceiptError, from_text, recognize, MAX_IMAGE_BYTES
 class ReceiptInput(StatesGroup):
     amount = State()
     description = State()
+    category_name = State()
 
 
 def markup(*rows):
@@ -34,6 +36,7 @@ def markup(*rows):
 
 def preview(db: Database, draft, tz: str) -> tuple[str, InlineKeyboardMarkup]:
     data = json.loads(draft["items_json"])
+    store = ReceiptStore(db)
     amount = draft["total_minor"]
     total_ok = bool(amount and data and sum(i["amount_minor"] for i in data) == amount)
     source = next((s["name"] for s in db.sources(draft["user_id"]) if s["id"] == draft["source_id"]), "неизвестен")
@@ -41,6 +44,7 @@ def preview(db: Database, draft, tz: str) -> tuple[str, InlineKeyboardMarkup]:
         "🧾 Распознанный чек — ПРОВЕРЬ ПЕРЕД ЗАПИСЬЮ",
         "Сумма: " + (rub(amount) if amount else "НЕ РАСПОЗНАНА"),
         f"Название: {draft['description']}",
+        f"Категория (общая сумма): {store.category_label(draft['user_id'], draft['description'], draft['category_id'])}",
         f"Источник: {source}",
         "Дата: " + datetime.fromisoformat(draft["occurred_at"]).astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M"),
         "Фискальный QR: " + ("прочитан" if draft["qr_text"] else "не удалось прочитать"),
@@ -50,13 +54,14 @@ def preview(db: Database, draft, tz: str) -> tuple[str, InlineKeyboardMarkup]:
     if data:
         lines.append("\nСтроки, предположительно распознанные OCR:")
         for item in data[:10]:
-            lines.append(f"• {item['name'][:60]} — {rub(item['amount_minor'])}")
+            category_name = store.category_label(draft["user_id"], item["name"], item.get("category_id"))
+            lines.append(f"• {item['name'][:60]} — {rub(item['amount_minor'])} [{category_name}]")
         if len(data) > 10:
             lines.append(f"… и ещё {len(data) - 10}")
         if not total_ok:
-            lines.append("\nРазбивка не подтверждена: суммы позиций не совпали с итогом.")
+            lines.append("\nРазбивка неполная или ошибочная: не все товары и цены распознаны. Записать по товарам пока нельзя.")
         else:
-            lines.append("\nСумма позиций совпадает с итогом.")
+            lines.append("\nСумма позиций совпадает с итогом. Всё равно проверь названия и категории.")
     else:
         lines.append("\nСписок товаров распознать надёжно не удалось.")
     lines.append("\nДанные не сохранены в расходы. Сначала проверь сумму и источник.")
@@ -68,7 +73,7 @@ def preview(db: Database, draft, tz: str) -> tuple[str, InlineKeyboardMarkup]:
             rows.append([("🛒 Записать по товарам", f"rc:save:{ident}:items")])
     rows.extend([
         [("💳 Источник", f"rc:sources:{ident}:0"), ("💰 Сумма", f"rc:amount:{ident}")],
-        [("📝 Название", f"rc:name:{ident}")],
+        [("📝 Название", f"rc:name:{ident}"), ("📁 Категории", f"rc:cats:{ident}")],
         [("✖️ Не записывать", f"rc:discard:{ident}")],
     ])
     return "\n".join(lines), markup(*rows)
@@ -88,6 +93,32 @@ def sources_markup(db: Database, uid: int, draft_id: int, page: int, selected_id
         navigation.append(("▶️", f"rc:sources:{draft_id}:{page + 1}"))
     if navigation:
         rows.append(navigation)
+    rows.append([("↩️ К чеку", f"rc:back:{draft_id}")])
+    return markup(*rows)
+
+
+def category_targets(draft):
+    buttons = [[("🧾 Общая сумма", f"rc:catlist:{draft['id']}:all:0")]]
+    for index, item in enumerate(json.loads(draft["items_json"])[:20]):
+        buttons.append([(f"{index + 1}. {item['name'][:38]}", f"rc:catlist:{draft['id']}:{index}:0")])
+    buttons.append([("↩️ К чеку", f"rc:back:{draft['id']}")])
+    return markup(*buttons)
+
+
+def category_choices(db: Database, draft_id: int, user_id: int, slot: str, page: int):
+    categories = db.categories(user_id)
+    pages = max(1, math.ceil(len(categories) / 8))
+    page = min(max(0, page), pages - 1)
+    rows = [[(r["name"], f"rc:catset:{draft_id}:{slot}:{r['id']}")]
+            for r in categories[page * 8:(page + 1) * 8]]
+    navigation = []
+    if page:
+        navigation.append(("◀️", f"rc:catlist:{draft_id}:{slot}:{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(("▶️", f"rc:catlist:{draft_id}:{slot}:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([("➕ Новая категория", f"rc:catnew:{draft_id}:{slot}")])
     rows.append([("↩️ К чеку", f"rc:back:{draft_id}")])
     return markup(*rows)
 
@@ -182,6 +213,35 @@ def register_receipts(router: Router, db: Database, store: ReceiptStore, timezon
                  else "Введи название покупки") + ".\n/cancel — отмена ввода.",
                 reply_markup=ForceReply(selective=True),
             )
+        elif action == "cats":
+            await callback.message.edit_text(
+                "Выбери, для какой записи исправить категорию:",
+                reply_markup=category_targets(draft),
+            )
+        elif action == "catlist":
+            if len(args) != 5:
+                return await callback.answer("Устаревшая кнопка.", show_alert=True)
+            slot = args[3]
+            await callback.message.edit_text(
+                "Выбери категорию для " + ("всей покупки" if slot == "all" else f"товара #{int(slot) + 1}") + ":",
+                reply_markup=category_choices(db, draft_id, uid, slot, int(args[4])),
+            )
+        elif action == "catset":
+            if len(args) != 5 or not args[4].isdigit():
+                return await callback.answer("Устаревшая кнопка.", show_alert=True)
+            if not store.set_category(uid, draft_id, args[3], int(args[4])):
+                return await callback.answer("Категория или товар недоступны.", show_alert=True)
+            label, keyboard = preview(db, store.draft(uid, draft_id), timezone)
+            await callback.message.edit_text("Категория изменена.\n\n" + label, reply_markup=keyboard)
+        elif action == "catnew":
+            if len(args) != 4:
+                return await callback.answer("Устаревшая кнопка.", show_alert=True)
+            await state.set_state(ReceiptInput.category_name)
+            await state.update_data(receipt_draft_id=draft_id, category_slot=args[3])
+            await callback.message.answer(
+                "Напиши название новой категории. Она сразу будет выбрана.\n/cancel — отмена.",
+                reply_markup=ForceReply(selective=True),
+            )
         elif action == "sources":
             page = int(args[3]) if len(args) > 3 and args[3].isdigit() else 0
             await callback.message.edit_text("Выбери источник списания:",
@@ -213,6 +273,26 @@ def register_receipts(router: Router, db: Database, store: ReceiptStore, timezon
         await state.clear()
         label, keyboard = preview(db, store.draft(message.from_user.id, draft_id), timezone)
         await message.answer("Сумма изменена.\n\n" + label, reply_markup=keyboard)
+
+    @router.message(ReceiptInput.category_name)
+    async def receipt_category_name(message: Message, state: FSMContext):
+        if not message.text or message.text.startswith("/"):
+            return await message.answer("Введи название категории или /cancel.")
+        info = await state.get_data()
+        try:
+            name = db._clean_category_name(message.text)
+            category = next((r for r in db.categories(message.from_user.id)
+                             if r["name"].casefold() == name.casefold()), None)
+            category_id = category["id"] if category else db.add_category(message.from_user.id, name)
+            changed = store.set_category(message.from_user.id, info["receipt_draft_id"],
+                                         info["category_slot"], category_id)
+        except (ValueError, sqlite3.IntegrityError, ReceiptError) as exc:
+            return await message.answer(str(exc) + "\nПопробуй ещё раз или /cancel.")
+        await state.clear()
+        if not changed:
+            return await message.answer("Чек недоступен.")
+        label, keyboard = preview(db, store.draft(message.from_user.id, info["receipt_draft_id"]), timezone)
+        await message.answer("Категория выбрана.\n\n" + label, reply_markup=keyboard)
 
     @router.message(ReceiptInput.description)
     async def receipt_description(message: Message, state: FSMContext):

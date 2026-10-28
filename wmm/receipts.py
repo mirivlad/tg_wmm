@@ -88,6 +88,17 @@ def fiscal_qr(text: str, tz: str) -> tuple[int, str, str] | None:
     return total, at.isoformat(timespec="seconds"), "fiscal:" + identity
 
 
+def _conflicting_weight_formula(name: str, line: str) -> bool:
+    """Prevent a 250g weighed item price from attaching to a 1kg package."""
+    normalized_name = re.sub(r"(?<=\d)[ОоOo](?=г\b)", "0", name)
+    packs = [int(x) for x in re.findall(r"(?<!\d)(\d{3,4})\s*[гg]\b", normalized_name, re.I)]
+    amount = re.search(r"[*×xх]\s*(\d+(?:[.,]\d+)?)\s*(?:кг|kg)\b", line, re.I)
+    if not amount or not packs:
+        return False
+    bought_grams = float(amount.group(1).replace(",", ".")) * 1000
+    return max(packs) >= 500 and bought_grams < max(packs) * 0.70
+
+
 def parse_items(text: str) -> tuple[Item, ...]:
     """Pair VAT-labelled product lines with their separate price/quantity lines.
 
@@ -138,6 +149,10 @@ def parse_items(text: str) -> tuple[Item, ...]:
 
         if arithmetic:
             if pending:
+                if _conflicting_weight_formula(pending, cleaned):
+                    # Another product (e.g. loose crackers) has lost its name.
+                    # Do NOT assign its price to the next readable product.
+                    continue
                 append(pending, amount)
                 pending = None
                 if len(result) > MAX_ITEMS:
@@ -255,6 +270,29 @@ def recognize(image_bytes: bytes, tz: str) -> Recognized:
             raise ReceiptError("Не удалось распознать текст. Попробуй более чёткое фото.") from exc
         text = ""
     result = from_text(image_bytes, qr_text, text, tz)
+    # A dense receipt is often detected unevenly across its full height.
+    # A second, higher-contrast product-only crop may recover an item that
+    # vanished in the full-image pass (such as the wine line in this receipt).
+    if result.total_minor and not result.items_match_total and h > w:
+        products = gray_original.crop((0, int(h * 0.16), w, int(h * 0.54)))
+        products = ImageOps.autocontrast(products)
+        products = ImageEnhance.Sharpness(products).enhance(1.35)
+        products = products.resize((int(products.width * 1.5), int(products.height * 1.5)))
+        try:
+            alternative_text = read_text(products)
+            alternative_items = parse_items(alternative_text)
+            def quality(items):
+                subtotal = sum(i.amount_minor for i in items)
+                if subtotal > result.total_minor:
+                    return (-1, 0, 0)
+                return (int(subtotal == result.total_minor),
+                        len(items), -abs(result.total_minor - subtotal))
+            if alternative_items and quality(alternative_items) > quality(result.items):
+                result = replace(result, items=alternative_items,
+                                 ocr_text=(result.ocr_text + "\n[Дополнительный OCR товаров]\n" +
+                                           alternative_text)[:12000])
+        except (RuntimeError, OSError, ValueError):
+            pass
     if result.total_minor is None:
         # Targeted fallback: payment/fiscal block usually occupies the bottom
         # half of long receipts. Keep this OCR separate so duplicate product
