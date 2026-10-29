@@ -10,21 +10,11 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
-from .receipt_heuristics import clean_item_name, detected_date, detected_total, is_service_line
+from .receipt_heuristics import detected_date, detected_total
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
 MAX_ITEMS = 25
-
-AMOUNT = re.compile(r"(?<!\d)(\d{1,7}(?:[ \u00a0]\d{3})*[,.]\d{2})(?!\d)")
-TOTAL = re.compile(r"(?:^|\s)(?:итого|к\s+оплате|сумма\s+чека|всего\s+к\s+оплате|общая\s+сумма)\s*[:=]?\s*(\d[\d \u00a0]*[.,]\d{2})", re.I)
-SKIP = re.compile(
-    r"(^|\s)(?:итого|сумма|всего|к\s+оплате|ндс|скидк|сдача|оплачено|наличн|"
-    r"безнал|банковск|кассир|чек|фд|фн|фп|инн|рн|ккт|qr|номер|дата|время|"
-    r"скидка|бонус|спасибо|покупок|сайт|www|http|электронн|налог|получен|"
-    r"провер|эквайр|терминал)\b", re.I
-)
-
 
 class ReceiptError(ValueError):
     pass
@@ -88,91 +78,11 @@ def fiscal_qr(text: str, tz: str) -> tuple[int, str, str] | None:
     return total, at.isoformat(timespec="seconds"), "fiscal:" + identity
 
 
-def _conflicting_weight_formula(name: str, line: str) -> bool:
-    """Prevent a 250g weighed item price from attaching to a 1kg package."""
-    normalized_name = re.sub(r"(?<=\d)[ОоOo](?=г\b)", "0", name)
-    packs = [int(x) for x in re.findall(r"(?<!\d)(\d{3,4})\s*[гg]\b", normalized_name, re.I)]
-    amount = re.search(r"[*×xх]\s*(\d+(?:[.,]\d+)?)\s*(?:кг|kg)\b", line, re.I)
-    if not amount or not packs:
-        return False
-    bought_grams = float(amount.group(1).replace(",", ".")) * 1000
-    return max(packs) >= 500 and bought_grams < max(packs) * 0.70
-
-
 def parse_items(text: str) -> tuple[Item, ...]:
-    """Pair VAT-labelled product lines with their separate price/quantity lines.
-
-    A standalone terminal or fiscal amount must never become a product.
-    A sum matching the receipt's total is necessary but not sufficient for
-    trusting the itemization: the user must review it in Telegram.
-    """
-    from .receipt_heuristics import VAT_PREFIX
-
-    result: list[Item] = []
-    pending: str | None = None
-
-    def append(name: str, amount: int) -> None:
-        if amount > 0 and name and re.search(r"[А-Яа-яЁёA-Za-z]{3,}", name):
-            result.append(Item(name=name[:100], amount_minor=amount))
-
-    for raw in text.splitlines():
-        line = re.sub(r"\s+", " ", raw.strip()).strip("-–* ")
-        vat_label = VAT_PREFIX.match(line)
-        if vat_label:
-            pending = None
-        cleaned = clean_item_name(VAT_PREFIX.sub("", line))
-        if not cleaned or is_service_line(cleaned):
-            continue
-
-        prices = list(AMOUNT.finditer(cleaned))
-        amount_match = prices[-1] if prices else None
-        arithmetic = bool(re.search(r"\d[\d.,]*\s*[*×xх]\s*\d", cleaned, re.I) and
-                          "=" in cleaned)
-
-        if not amount_match:
-            if vat_label:
-                # A new VAT label starts a new item. Never reuse an unrelated
-                # previous name when the price for it was not readable.
-                pending = cleaned if re.search(r"[А-Яа-яЁёA-Za-z]{3,}", cleaned) else None
-            elif pending and not re.search(r"^\d", cleaned):
-                pending = (pending + " " + cleaned)[:180]
-            continue
-
-        try:
-            amount = money_to_minor(amount_match.group(1))
-        except ReceiptError:
-            continue
-
-        after = cleaned[amount_match.end():].strip(" ₽р.уб")
-        if after and not re.fullmatch(r"[₽руб.\s]*", after, re.I):
-            continue
-
-        if arithmetic:
-            if pending:
-                if _conflicting_weight_formula(pending, cleaned):
-                    # Another product (e.g. loose crackers) has lost its name.
-                    # Do NOT assign its price to the next readable product.
-                    continue
-                append(pending, amount)
-                pending = None
-                if len(result) > MAX_ITEMS:
-                    return ()
-                continue
-            product_name = clean_item_name(cleaned[:amount_match.start()])
-            # Product and price may share a line; name before its formula.
-            if product_name:
-                append(product_name, amount)
-        else:
-            name = clean_item_name(cleaned[:amount_match.start()])
-            if vat_label or (name and not pending):
-                append(name, amount)
-            elif pending and name:
-                append(pending + " " + name, amount)
-            pending = None
-
-        if len(result) > MAX_ITEMS:
-            return ()
-    return tuple(result)
+    """Reconstruct item/price groups without guessing nearest-line matches."""
+    from .item_parser import parse_lines
+    return tuple(Item(name, amount) for name, amount in
+                 parse_lines(text, money_to_minor, MAX_ITEMS))
 
 
 def ocr_total(text: str) -> int | None:

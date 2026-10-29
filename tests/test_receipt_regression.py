@@ -64,10 +64,48 @@ class RealReceiptRegressionTests(unittest.TestCase):
 ндс 22% пакет-майка пнд 38+1860 23мк с логотипом аллея: 1500
 10.00*2шT.=20.00"""
         items = parse_items(ocr)
-        coffee = next(x for x in items if "КОФе" in x.name)
-        self.assertEqual(coffee.amount_minor, 149999)
+        # With one visible product header and two prices, the association is
+        # ambiguous. It is safer to omit the item than invent a price.
+        self.assertFalse(any("КОФе" in x.name for x in items))
         self.assertNotIn(9000, [x.amount_minor for x in items])
         self.assertNotIn(69999, [x.amount_minor for x in items])  # wine name missing
+
+    def test_real_two_header_two_price_run_restores_all_five_items(self):
+        """Actual saved alternate OCR contains 5 products and 5 amount formulas."""
+        sample = """НAC 10% СУХАРИКИ
+CхаpeBb
+ржаные
+Бородинские с чесноком <пл
+aстинa); 3
+НДС 22% КОФе Бариста Про Бар зерно 100 м6
+359.99*0.250KG=90.00
+1499.99*1ШT.=1499.99
+АКЦИ3
+699.99
+НДс 22% Вино Санта Каролина Селлар
+Селекшн Совиньон Блан бел сух
+11.5-12% 0.75n
+699.99*1ШT.=699.99
+НДС 10% БУлОчка
+Детство с сахаром 55г Командор
+р 12.99*6Т.=77.94
+Ндс 22% пакет-майка пнд 38+18 2мк с логотипом алле 1500
+10.00*2WT.=20.00
+Сумма без скидки:
+2947.92"""
+        items = parse_items(sample)
+        self.assertEqual([x.amount_minor for x in items],
+                         [9000, 149999, 69999, 7794, 2000])
+        self.assertEqual(sum(x.amount_minor for x in items), 238792)
+        self.assertTrue(items[0].name.casefold().startswith("сухарики"))
+        self.assertIn("КОФе", items[1].name)
+        self.assertIn("Вино", items[2].name)
+
+    def test_do_not_invent_when_price_lines_missing(self):
+        sample = """НАС 10% Сухарики
+НДС 22% Кофе 1000г
+1499.99*1ШТ.=1499.99"""
+        self.assertEqual(parse_items(sample), ())
 
     def test_never_classify_payment_or_discount_lines_as_items(self):
         items = parse_items(OCR_SAMPLE)
