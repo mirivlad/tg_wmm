@@ -124,6 +124,22 @@ aстинa); 3
     def test_corrupted_payment_label_alone_is_not_trusted(self):
         self.assertIsNone(ocr_total("CyHMaCPYE): 2387.52"))
 
+    def test_latest_ocr_wine_not_lost_after_bun_inline_price(self):
+        """Derived from newest OCR: wine formula appears after bun with inline price."""
+        sample = """НДС 10% Сухарики ржаные с чесноком
+НДС 22% Кофе зерно 1000г
+359.99*0.250Кг=90.00
+1499.99*1ШТ.=1499.99
+НДС 2% Вино Совиньон Блан белое сухое
+11.5-12% 0.75л
+НДС 10% Булочка с сахаром 12.99жт,77.94
+699.99*1ШТ.=699.99
+НДС 22% Пакет-майка 23мк
+10.00*2ШТ.=20.00
+Сумма без скидки: 2947.92"""
+        self.assertEqual([x.amount_minor for x in parse_items(sample)],
+                         [9000, 149999, 69999, 7794, 2000])
+
     def test_no_payment_marker_no_auto_inferred_total(self):
         bad = "Сумма без скидки: 2947.92\nКОМИССИЯ 0.00\nМОЛОКО 300.00"
         self.assertIsNone(ocr_total(bad))

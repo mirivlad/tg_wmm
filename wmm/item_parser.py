@@ -1,115 +1,139 @@
-"""Conservative line-item reconstruction for receipt OCR.
+"""Reconstruct receipt item lines without assuming that prices follow their names.
 
-A receipt may print several product descriptions, followed by their price
-formulas. Never bind the first following formula to the last description.
-Resolve a block only when number of formulas equals number of item headers.
+OCR can emit multiple product headers followed by a run of price formulas;
+it can also shift a formula past an unrelated inline-priced product. We
+therefore collect independent product headers and total-price formulas, then
+align only when counts match. Incomplete or ambiguous groups are rejected.
 """
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Callable
 
 from .receipt_heuristics import VAT_PREFIX, canonical, clean_item_name, is_service_line
 
-_PRICE = re.compile(r"(?<!\d)(\d{1,7}(?:[ \u00a0]\d{3})*[,.]\d{2})(?!\d)")
+_MONEY = re.compile(r"(?<!\d)(\d{1,7}(?:[ \u00a0]\d{3})*[,.]\d{2})(?!\d)")
 _FORMULA = re.compile(r"\d[\d,. ]*\s*[*×xхж]\s*\d", re.I)
+_EQUALS_TOTAL = re.compile(r"=\s*\d[\d,. ]*[,.]\d{2}\s*(?:₽|руб\.?)?\s*$", re.I)
 _WORD = re.compile(r"[А-Яа-яЁёA-Za-z]{3,}")
-# A formula containing an equals sign is stronger evidence of the line total.
-# For example 359.99 * 0.250KG = 90.00.
-_QUANTITY_FORMULA = re.compile(r"=\s*\d[\d,. ]*[,.]\d{2}\s*(?:₽|руб\.?)?\s*$", re.I)
-_BARCODE = re.compile(r"^(?:\d{9,}|[A-F0-9]{24,})$", re.I)
+_PAYMENT_SECTION = re.compile(
+    r"^(?:СУММА\s+(?:БЕЗ\s+СКИДКИ|ЧЕКА)|"
+    r"БАНКОВСКИЕ|БЕЗНАЛИЧНЫМИ|ИТОГО\b|К\s+ОПЛАТЕ\b|"
+    r"ПРИХОД\b|КАССОВЫЙ\s+ЧЕК\b)",
+    re.I,
+)
+_BAD_CONTINUATION = re.compile(
+    r"^(?:АКЦИЗ|АКЦИ[З3]|КОПИЛКА|ИНФОЦЕНТР|НДС|НАС|ИНН|ФН|ФД|ФП|"
+    r"СУММА|ТЕРМИНАЛ|ККТ|БАНКОВСКИЕ|ОПЛАТА|ЧЕК)\b",
+    re.I,
+)
 
 
-def parse_lines(text: str, money_to_minor: Callable[[str], int], max_items: int = 25):
-    """Return [(name, minor_amount)] or [] when parsing was too ambiguous."""
-    result: list[tuple[str, int]] = []
-    headers: list[str] = []
-    prices: list[int] = []
-    # A price sequence can refer to *several* preceding product headers.
-    # Do not choose the nearest header.
-    def flush() -> None:
-        nonlocal headers, prices
-        if (headers and len(headers) == len(prices) and
-                all(_WORD.search(name) for name in headers)):
-            result.extend((name[:100], price) for name, price in zip(headers, prices) if price > 0)
-        headers = []
-        prices = []
+@dataclass
+class _Product:
+    name: str
+    amount: int | None = None
+
+
+def parse_lines(text: str, money_to_minor: Callable[[str], int],
+                max_items: int = 25) -> list[tuple[str, int]]:
+    products: list[_Product] = []
+    free_formulas: list[int] = []
+    current: _Product | None = None
+    saw_item = False
 
     for raw in text.splitlines():
         line = " ".join(raw.strip().split()).strip("-–* ")
         if not line:
             continue
-        # OCR mixes Latin and Cyrillic lookalikes, e.g. "НAC" for "НАС".
-        vat_match = VAT_PREFIX.match(canonical(line))
-        vat = vat_match is not None
-        without_vat = line[vat_match.end():] if vat_match else line
-        # A price formula starts with digits; clean_item_name would mistake
-        # the first 3 digits and dot for an enumerated list marker.
-        cleaned = (without_vat if without_vat[:1].isdigit()
-                   else clean_item_name(without_vat))
-        if not cleaned or is_service_line(cleaned) or _BARCODE.fullmatch(cleaned):
+        folded = canonical(line)
+        if saw_item and _PAYMENT_SECTION.match(folded):
+            break
+
+        # VAT may be distorted: "НАС 10%" or "НДС 2%" for "НДС 22%".
+        # A printed 10% can become "1O%" with Latin/Cyrillic O in OCR.
+        normalized_vat = re.sub(r"(?<=\d)[ОO](?=\s*%)", "0", folded)
+        match = VAT_PREFIX.match(normalized_vat)
+        vat = match is not None
+        cleaned = line[match.end():].strip() if match else line
+        cleaned = (cleaned if cleaned[:1].isdigit() else clean_item_name(cleaned))
+        if not cleaned or is_service_line(cleaned):
+            current = None
             continue
 
-        matches = list(_PRICE.finditer(cleaned))
-        formula = bool(_FORMULA.search(cleaned)) and bool(_QUANTITY_FORMULA.search(cleaned))
-        first_price = matches[0] if matches else None
-        last_price = matches[-1] if matches else None
-
-        # A VAT label always begins a separate product. If the current block
-        # already has price formulae, finish the block before adding this item.
-        if vat and prices:
-            flush()
-
-        if formula and last_price:
+        amounts = list(_MONEY.finditer(cleaned))
+        is_formula = (bool(_FORMULA.search(cleaned)) and
+                      bool(_EQUALS_TOTAL.search(cleaned)))
+        if is_formula and amounts:
             try:
-                amount = money_to_minor(last_price.group(1))
+                value = money_to_minor(amounts[-1].group(1))
             except ValueError:
+                current = None
                 continue
-            # A name preceding the first unit price signals an inline formula.
-            leading = cleaned[:first_price.start()].strip(" .,;:-") if first_price else ""
-            if vat and _WORD.search(leading):
-                # Product and its own line total.
-                flush()
-                result.append((leading[:100], amount))
-            elif leading and _WORD.search(leading) and not headers:
-                result.append((leading[:100], amount))
-            elif headers:
-                prices.append(amount)
-            # Without any labelled item, the formula is orphaned: ignore it.
+            before = cleaned[:amounts[0].start()].strip(" .:;–-")
+            if vat and _WORD.search(before):
+                products.append(_Product(before[:160], value))
+            elif (before and len(before) > 3 and _WORD.search(before)
+                  and not is_service_line(before)):
+                # A shop may show a product and its formula on the same
+                # line without VAT annotations.
+                products.append(_Product(before[:160], value))
+            elif saw_item:
+                free_formulas.append(value)
+            current = None
+            saw_item = True
             continue
 
-        if vat and not last_price:
-            if _WORD.search(cleaned):
-                headers.append(cleaned[:160])
+        if vat and _WORD.search(cleaned):
+            saw_item = True
+            if amounts:
+                # Inline-priced product is independent of nearby formula runs.
+                last = amounts[-1]
+                name = cleaned[:last.start()].strip(" .:;-–")
+                if _WORD.search(name):
+                    try:
+                        products.append(_Product(name[:160], money_to_minor(last.group(1))))
+                    except ValueError:
+                        pass
+                current = None
+            else:
+                current = _Product(cleaned[:160])
+                products.append(current)
             continue
 
-        if vat and last_price:
-            try:
-                amount = money_to_minor(last_price.group(1))
-            except ValueError:
-                continue
-            name = clean_item_name(cleaned[:last_price.start()])
-            if name and _WORD.search(name):
-                flush()
-                result.append((name[:100], amount))
+        if amounts:
+            last = amounts[-1]
+            # Ordinary line "МОЛОКО 120,00" without VAT.
+            leading = cleaned[:last.start()].strip(" .:;–-")
+            trailing = cleaned[last.end():].strip(" ₽р.уб")
+            if (_WORD.search(leading) and not trailing and
+                    not is_service_line(leading) and not _BAD_CONTINUATION.match(canonical(leading))):
+                try:
+                    products.append(_Product(leading[:160],
+                                             money_to_minor(last.group(1))))
+                    saw_item = True
+                except ValueError:
+                    pass
+            current = None
             continue
 
-        # A two-token numeric price/quantity line without an '=' may be an
-        # alcohol percentage, a tax or the register payment. Never assign it.
-        if last_price and not formula:
-            name = clean_item_name(cleaned[:last_price.start()])
-            trailing = cleaned[last_price.end():].strip(" ₽руб.")
-            if (name and _WORD.search(name) and not trailing
-                    and not headers and not is_service_line(name)):
-                result.append((name[:100], money_to_minor(last_price.group(1))))
-            # Standalone amounts are ignored, never taken as pending item prices.
-            continue
+        # Join wrapped product names, but never unrelated fiscal metadata.
+        if (current is not None and _WORD.search(cleaned) and
+                not cleaned[:1].isdigit() and
+                not _BAD_CONTINUATION.match(folded) and
+                not re.match(r"^\d{1,2}[.,]\d", cleaned)):
+            current.name = (current.name + " " + cleaned)[:160]
 
-        # Name continued onto another line before any formulas.
-        if headers and not prices and not cleaned[0].isdigit() and _WORD.search(cleaned):
-            if len(headers[-1]) < 145:
-                headers[-1] = (headers[-1] + " " + cleaned)[:160]
-
-    flush()
-    # Nonmatching blocks are intentionally dropped, not guessed.
+    pending = [product for product in products if product.amount is None]
+    if len(pending) == len(free_formulas):
+        for product, amount in zip(pending, free_formulas):
+            product.amount = amount
+    # If counts differ, matching is ambiguous: retain only known inline
+    # products. We must not silently shift prices between products.
+    result = [
+        (product.name[:100], product.amount)
+        for product in products
+        if product.amount is not None and product.amount > 0
+    ]
     return result if len(result) <= max_items else []
